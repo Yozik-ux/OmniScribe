@@ -63,6 +63,20 @@ HALLUCINATIONS = {
 
 _PUNCT = ".,!?;:—–-\"'«»()[]…"
 
+# Моделі, які приймають output_config.effort і adaptive thinking. На старших
+# (haiku-4-5, sonnet-4-5) ці параметри повертають 400, тому їх просто не шлемо:
+# thinking там і так вимкнене, якщо поле відсутнє.
+_EFFORT_MODELS = (
+    "claude-opus-4-6",
+    "claude-opus-4-7",
+    "claude-opus-4-8",
+    "claude-opus-5",
+    "claude-sonnet-4-6",
+    "claude-sonnet-5",
+    "claude-fable-5",
+    "claude-mythos-5",
+)
+
 
 def _normalize(text: str) -> str:
     lowered = text.lower()
@@ -88,7 +102,7 @@ class NoteBuilder:
         self,
         groq_api_key: str,
         anthropic_api_key: str,
-        model: str = "claude-sonnet-5",
+        model: str = "claude-haiku-4-5",
         effort: str = "low",
         whisper_model: str = "whisper-large-v3",
         language: str = "uk",
@@ -98,6 +112,7 @@ class NoteBuilder:
         self.claude = anthropic.Anthropic(api_key=anthropic_api_key)
         self.model = model
         self.effort = effort
+        self._tuning_supported = model.startswith(_EFFORT_MODELS)
         self.whisper_model = whisper_model
         self.language = language
 
@@ -156,17 +171,22 @@ class NoteBuilder:
             )
         parts.append(f"<новий_фрагмент>\n{raw_text}\n</новий_фрагмент>")
 
+        kwargs = {
+            "model": self.model,
+            "max_tokens": 1500,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": "\n\n".join(parts)}],
+        }
+        if self._tuning_supported:
+            kwargs["output_config"] = {"effort": self.effort}
+            # Для realtime-конвеєра думати немає сенсу: завдання —
+            # редактура короткого фрагмента, а латентність видно студенту.
+            # Виняток: Opus 5 не дозволяє вимкнене thinking на xhigh/max.
+            if self.effort not in ("xhigh", "max"):
+                kwargs["thinking"] = {"type": "disabled"}
+
         try:
-            message = self.claude.messages.create(
-                model=self.model,
-                max_tokens=1500,
-                # Для realtime-конвеєра думати немає сенсу: завдання —
-                # редактура короткого фрагмента, а латентність видно студенту.
-                thinking={"type": "disabled"},
-                output_config={"effort": self.effort},
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": "\n\n".join(parts)}],
-            )
+            message = self.claude.messages.create(**kwargs)
         except anthropic.APIError as exc:
             print(f"⚠️ Claude недоступний ({exc}) — лишаю сирий текст.", flush=True)
             return None

@@ -47,7 +47,10 @@ class Config:
         self.document_id = _get("CONSPEKT_DOCUMENT_ID")
         self.share_with = _get("CONSPEKT_SHARE_WITH")
 
-        self.model = _get("CONSPEKT_MODEL", "claude-sonnet-5")
+        # Дефолт — найдешевша модель ($1/$5 за 1M токенів). Для вищої якості
+        # редактури постав у .env CONSPEKT_MODEL=claude-sonnet-5 ($3/$15)
+        # або claude-opus-5 ($5/$25).
+        self.model = _get("CONSPEKT_MODEL", "claude-haiku-4-5")
         self.effort = _get("CONSPEKT_EFFORT", "low")
         self.whisper_model = _get("CONSPEKT_WHISPER_MODEL", "whisper-large-v3")
         self.language = _get("CONSPEKT_LANGUAGE", "uk")
