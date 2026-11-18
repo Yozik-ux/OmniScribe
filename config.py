@@ -1,14 +1,31 @@
 """Налаштування конспектора: читаються з оточення або з файлу .env.
 
 Ключі більше не живуть у коді. Порядок пріоритету:
-   змінна оточення  >  .env  >  значення за замовчуванням
+   змінна оточення  >  .env користувача  >  .env поруч із кодом  >  дефолт
+
+Де лежить .env, залежить від того, як застосунок запущено. У розробці —
+поруч із кодом, бо так зручно. У встановленій версії — у теці користувача
+(~/.omniscribe/.env), бо тека встановлення доступна лише на читання:
+Program Files вимагає адміністратора, а .app на macOS підписаний, тож
+спроба зберегти ключі з вікна налаштувань там просто впала б.
 """
 
 import os
+import sys
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
+USER_DIR = Path.home() / ".omniscribe"
+
+
+def _env_path() -> Path:
+    if getattr(sys, "frozen", False):
+        USER_DIR.mkdir(parents=True, exist_ok=True)
+        return USER_DIR / ".env"
+    return BASE_DIR / ".env"
+
+
+ENV_PATH = _env_path()
 
 
 def _load_env_file(path: Path) -> None:
@@ -25,7 +42,11 @@ def _load_env_file(path: Path) -> None:
         os.environ.setdefault(key.strip(), value)
 
 
+# Спершу користувацький .env, потім той, що поруч із кодом: setdefault
+# всередині означає, що перший прочитаний виграє.
 _load_env_file(ENV_PATH)
+if ENV_PATH != BASE_DIR / ".env":
+    _load_env_file(BASE_DIR / ".env")
 
 
 def _get(name: str, default: str = "") -> str:
