@@ -1,0 +1,37 @@
+OmniScribe
+Copyright (c) 2026 Artem Horkusha, Iliya Mosiichyk. All rights reserved.
+
+PROPRIETARY SOFTWARE — ALL RIGHTS RESERVED
+
+This software and its source code are proprietary and confidential.
+The source code is made visible for review and evaluation purposes only;
+visibility does not grant any licence to use it.
+
+You MAY NOT, without prior written permission from the copyright holders:
+
+  1. copy, reproduce or redistribute this software or its source code,
+     in whole or in part, in source or binary form;
+  2. modify, adapt, translate or create derivative works based on it;
+  3. use it for any commercial purpose, or in any product or service;
+  4. sublicense, sell, lease, rent or otherwise transfer rights to it;
+  5. remove or alter any copyright, trademark or attribution notice.
+
+Installing and running an official OmniScribe build for personal,
+non-commercial use is permitted.
+
+Third-party components retain their own licences:
+
+  - Inter, Jost, Playfair Display — SIL Open Font License 1.1
+    (full texts in assets/fonts/)
+  - Qt for Python (PySide6) — LGPL v3
+  - PortAudio (via sounddevice) — MIT
+  - python-docx — MIT
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+Licensing enquiries: gorkusaartem700@gmail.com
