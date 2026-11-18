@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+ENV_PATH = BASE_DIR / ".env"
 
 
 def _load_env_file(path: Path) -> None:
@@ -24,7 +25,7 @@ def _load_env_file(path: Path) -> None:
         os.environ.setdefault(key.strip(), value)
 
 
-_load_env_file(BASE_DIR / ".env")
+_load_env_file(ENV_PATH)
 
 
 def _get(name: str, default: str = "") -> str:
@@ -43,9 +44,7 @@ class Config:
         self.groq_api_key = _get("GROQ_API_KEY")
         self.anthropic_api_key = _get("ANTHROPIC_API_KEY")
 
-        self.credentials_file = str(BASE_DIR / _get("CONSPEKT_CREDENTIALS", "credentials.json"))
-        self.document_id = _get("CONSPEKT_DOCUMENT_ID")
-        self.share_with = _get("CONSPEKT_SHARE_WITH")
+        self.theme = _get("OMNISCRIBE_THEME", "dark")
 
         # Дефолт — найдешевша модель ($1/$5 за 1M токенів). Для вищої якості
         # редактури постав у .env CONSPEKT_MODEL=claude-sonnet-5 ($3/$15)
@@ -54,6 +53,8 @@ class Config:
         self.effort = _get("CONSPEKT_EFFORT", "low")
         self.whisper_model = _get("CONSPEKT_WHISPER_MODEL", "whisper-large-v3")
         self.language = _get("CONSPEKT_LANGUAGE", "uk")
+        # detailed | concise | exam — див. notes_ai.PRESET_NOTES
+        self.preset = _get("CONSPEKT_PRESET", "detailed")
 
         self.host = _get("CONSPEKT_HOST", "0.0.0.0")
         self.port = _get_int("CONSPEKT_PORT", 8085)

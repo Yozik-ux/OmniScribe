@@ -1,14 +1,20 @@
-"""AI-конспектор: приймає аудіопотік, пише конспект у Google Docs у реальному часі.
+"""OmniScribe: приймає аудіопотік, пише конспект у Google Docs у реальному часі.
 
-Архітектура (три незалежні потоки, щоб мережа ніколи не чекала на API):
+Архітектура (чотири незалежні потоки, щоб мережа ніколи не чекала на API):
 
-    C++ клієнт --TCP--> [reader thread] --VAD--> queue --> [worker thread] --> Google Docs
-                         тільки recv               сегменти    Whisper + Claude
+    C++ клієнт --TCP--> [reader] --VAD--> audio_q --> [transcriber] --> text_q --> [composer] --> Google Docs
+                         тільки recv       сегменти    Whisper            текст      Claude + запис
 
 Раніше обробка викликалась із recv-циклу: поки йшли Whisper і Claude (кілька
 секунд), conn.recv() не викликався, TCP-буфер набивався, backpressure доходив до
-C++ і вбивав аудіо-callback. Тепер reader лише читає, а вся мережа до API живе в
-окремому воркері.
+C++ і вбивав аудіо-callback. Тепер reader лише читає.
+
+Транскрибування й конспектування теж розділені на окремі потоки: раніше один
+воркер робив Whisper → Claude → запис послідовно, і поки Claude (найповільніший
+крок) дописував фрагмент, наступний шматок мовлення чекав розпізнавання.
+Тепер transcriber безперервно забирає аудіо з audio_q і кладе розпізнаний текст
+у text_q, а composer окремим потоком забирає звідти й пише в Docs — Claude
+більше не блокує Whisper, і контекст лекції не втрачається через черговість.
 """
 
 import io
@@ -18,6 +24,7 @@ import socket
 import struct
 import sys
 import threading
+from dataclasses import dataclass
 
 from config import Config
 from mdlite import Block
@@ -38,21 +45,31 @@ _stop = threading.Event()
 # ---------------------------------------------------------------------- воркер
 
 
-def worker_loop(work_q: "queue.Queue", notes, writer) -> None:
-    """Один воркер = гарантований порядок фрагментів у документі."""
+@dataclass
+class Transcribed:
+    raw: str
+    pending: str | None
+    cut_mid_sentence: bool
+
+
+def transcribe_loop(audio_q: "queue.Queue", text_q: "queue.Queue", notes, writer) -> None:
+    """Безперервно розпізнає аудіо (Whisper) — не чекає, поки Claude допише
+    попередній фрагмент, тому мовлення ніколи не втрачає контекст черговістю.
+    """
     while True:
-        item = work_q.get()
+        segment = audio_q.get()
         try:
-            if item is None:
+            if segment is None:
+                text_q.put(None)  # передати сигнал завершення далі по конвеєру
                 return
-            _process_segment(item, notes, writer)
+            _transcribe_segment(segment, text_q, notes, writer)
         except Exception as exc:  # noqa: BLE001 — один поганий сегмент не валить сесію
-            print(f"❌ Помилка обробки сегмента: {exc}", flush=True)
+            print(f"❌ Помилка розпізнавання: {exc}", flush=True)
         finally:
-            work_q.task_done()
+            audio_q.task_done()
 
 
-def _process_segment(segment, notes, writer) -> None:
+def _transcribe_segment(segment, text_q: "queue.Queue", notes, writer) -> None:
     print(f"\n⏳ Розпізнаю {segment.duration:.1f} с…", flush=True)
     raw = notes.transcribe(segment.pcm, segment.sample_rate)
     if not raw:
@@ -64,16 +81,41 @@ def _process_segment(segment, notes, writer) -> None:
     # Чернетку видно студенту одразу, ще до Claude.
     pending = writer.insert_pending(raw) if writer else None
 
-    blocks = notes.polish(raw, cut_mid_sentence=segment.cut_mid_sentence)
-    if blocks is None:
+    _enqueue(
+        text_q,
+        Transcribed(raw=raw, pending=pending, cut_mid_sentence=segment.cut_mid_sentence),
+        describe=lambda t: f"розпізнаний текст ({len(t.raw)} символів)",
+    )
+
+
+def polish_loop(text_q: "queue.Queue", notes, writer) -> None:
+    """Окремий потік: Claude формує конспект і пише в Docs, без очікування —
+    поки він працює, transcribe_loop вже розпізнає наступний фрагмент.
+    """
+    while True:
+        item = text_q.get()
+        try:
+            if item is None:
+                return
+            _polish_item(item, notes, writer)
+        except Exception as exc:  # noqa: BLE001 — один поганий фрагмент не валить сесію
+            print(f"❌ Помилка конспектування: {exc}", flush=True)
+        finally:
+            text_q.task_done()
+
+
+def _polish_item(item: "Transcribed", notes, writer) -> None:
+    result = notes.polish(item.raw, cut_mid_sentence=item.cut_mid_sentence)
+    if result is None:
         # Claude не спрацював — краще лишити сирий текст, ніж нічого.
-        blocks = [Block("para", raw)]
+        section_id, blocks = None, [Block("para", item.raw)]
         print("📝 (сирий текст)", flush=True)
     else:
+        section_id, blocks = result
         print("📝 " + " / ".join(b.text for b in blocks), flush=True)
 
     if writer:
-        writer.commit(pending, blocks)
+        writer.commit(item.pending, blocks, target_section_id=section_id)
 
 
 # ---------------------------------------------------------------------- reader
@@ -114,27 +156,31 @@ def _read_handshake(conn: socket.socket, default_rate: int) -> tuple[int, bytes]
     return rate, b""
 
 
-def _enqueue(work_q: "queue.Queue", segment) -> None:
+def _enqueue(q: "queue.Queue", item, describe=lambda x: "найстаріший фрагмент") -> None:
     """Не даємо черзі рости нескінченно, але й не приховуємо втрати."""
     try:
-        work_q.put_nowait(segment)
+        q.put_nowait(item)
         return
     except queue.Full:
         pass
     try:
-        dropped = work_q.get_nowait()
-        work_q.task_done()
+        dropped = q.get_nowait()
+        q.task_done()
         print(
-            f"⚠️ ЧЕРГА ПЕРЕПОВНЕНА: відкинуто найстаріший фрагмент "
-            f"({dropped.duration:.1f} с). API не встигає за мовленням.",
+            f"⚠️ ЧЕРГА ПЕРЕПОВНЕНА: відкинуто {describe(dropped)}. "
+            f"API не встигає за мовленням.",
             flush=True,
         )
     except queue.Empty:
         pass
     try:
-        work_q.put_nowait(segment)
+        q.put_nowait(item)
     except queue.Full:
-        print("⚠️ Фрагмент втрачено — черга досі повна.", flush=True)
+        print("⚠️ Елемент втрачено — черга досі повна.", flush=True)
+
+
+def _describe_segment(segment) -> str:
+    return f"найстаріший фрагмент ({segment.duration:.1f} с)"
 
 
 def handle_client(conn: socket.socket, addr, work_q: "queue.Queue", cfg: Config) -> None:
@@ -147,7 +193,7 @@ def handle_client(conn: socket.socket, addr, work_q: "queue.Queue", cfg: Config)
 
     if leftover:
         for seg in segmenter.feed(leftover):
-            _enqueue(work_q, seg)
+            _enqueue(work_q, seg, describe=_describe_segment)
 
     while not _stop.is_set():
         try:
@@ -161,11 +207,11 @@ def handle_client(conn: socket.socket, addr, work_q: "queue.Queue", cfg: Config)
 
         total_bytes += len(data)
         for seg in segmenter.feed(data):
-            _enqueue(work_q, seg)
+            _enqueue(work_q, seg, describe=_describe_segment)
 
     # Хвіст потоку теж має потрапити в конспект.
     for seg in segmenter.flush():
-        _enqueue(work_q, seg)
+        _enqueue(work_q, seg, describe=_describe_segment)
 
     minutes = total_bytes / 2 / rate / 60
     print(
@@ -203,24 +249,21 @@ def main() -> int:
         language=cfg.language,
     )
 
-    writer = None
-    try:
-        from docs_writer import DocsWriter
+    from local_notes import LocalNotesStore
 
-        writer = DocsWriter(
-            credentials_file=cfg.credentials_file,
-            document_id=cfg.document_id,
-            share_with=cfg.share_with,
-        )
-        print(f"✅ Google Docs: {writer.url}", flush=True)
-        if not writer.created:
-            writer.write_session_header()
-    except Exception as exc:  # noqa: BLE001 — без Docs сервер усе одно корисний у консолі
-        print(f"⚠️ Google Docs не підключено ({exc}). Пишу лише в консоль.", flush=True)
+    writer = LocalNotesStore()
+    print(f"✅ Конспект: {writer.url} (сесія {writer.session_id})", flush=True)
 
-    work_q: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
-    worker = threading.Thread(target=worker_loop, args=(work_q, notes, writer), name="worker")
-    worker.start()
+    audio_q: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
+    text_q: queue.Queue = queue.Queue(maxsize=cfg.queue_max)
+    transcriber = threading.Thread(
+        target=transcribe_loop, args=(audio_q, text_q, notes, writer), name="transcriber"
+    )
+    composer = threading.Thread(
+        target=polish_loop, args=(text_q, notes, writer), name="composer"
+    )
+    transcriber.start()
+    composer.start()
 
     def _on_signal(_sig, _frame):
         if not _stop.is_set():
@@ -247,15 +290,16 @@ def main() -> int:
             except OSError:
                 break
             try:
-                handle_client(conn, addr, work_q, cfg)
+                handle_client(conn, addr, audio_q, cfg)
             finally:
                 conn.close()
             if not _stop.is_set():
                 print(f"📡 Знову чекаю клієнта на {cfg.host}:{cfg.port}…", flush=True)
     finally:
         server.close()
-        work_q.put(None)
-        worker.join(timeout=120)
+        audio_q.put(None)
+        transcriber.join(timeout=120)
+        composer.join(timeout=120)
         print("👋 Готово.", flush=True)
         if writer:
             print(f"📄 Конспект: {writer.url}", flush=True)

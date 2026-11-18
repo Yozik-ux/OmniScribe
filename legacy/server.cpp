@@ -1,4 +1,4 @@
-// Клієнт захоплення звуку для AI-конспектора.
+// Клієнт захоплення звуку для OmniScribe.
 //
 // Що змінилось порівняно з першою версією і чому:
 //
@@ -53,6 +53,7 @@ constexpr int   SERVER_PORT = 8085;
 constexpr double ANTIALIAS_HZ = 7000.0;  // < 16000/2, з запасом
 
 std::atomic<bool> g_running{true};
+std::atomic<bool> g_paused{false};
 std::atomic<float> g_level{0.0f};
 std::atomic<uint64_t> g_dropped{0};
 
@@ -305,18 +306,23 @@ void senderThread(RingBuffer* ring, int deviceRate) {
 
 void meterThread() {
     while (g_running.load()) {
-        const float rms = g_level.load(std::memory_order_relaxed);
-        int bars = static_cast<int>(rms * 150.0f);
-        bars = std::clamp(bars, 0, 40);
+        std::string line;
+        if (g_paused.load()) {
+            line = "\rПауза                                                        ";
+        } else {
+            const float rms = g_level.load(std::memory_order_relaxed);
+            int bars = static_cast<int>(rms * 150.0f);
+            bars = std::clamp(bars, 0, 40);
 
-        std::string line = "\rСтримінг [";
-        line.append(bars, '#');
-        line.append(40 - bars, ' ');
-        line += "] ";
+            line = "\rСтримінг [";
+            line.append(bars, '#');
+            line.append(40 - bars, ' ');
+            line += "] ";
 
-        const uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
-        if (dropped > 0) {
-            line += "втрачено семплів: " + std::to_string(dropped) + " ";
+            const uint64_t dropped = g_dropped.load(std::memory_order_relaxed);
+            if (dropped > 0) {
+                line += "втрачено семплів: " + std::to_string(dropped) + " ";
+            }
         }
         std::cout << line << std::flush;
         std::this_thread::sleep_for(std::chrono::milliseconds(80));
@@ -324,6 +330,21 @@ void meterThread() {
 }
 
 // ------------------------------------------------------------ вибір пристрою
+
+// Машинно-читний список пристроїв для GUI: "індекс<TAB>назва" по рядку.
+void listDevices() {
+    const int deviceCount = Pa_GetDeviceCount();
+    if (deviceCount < 0) {
+        std::cerr << "Pa_GetDeviceCount: " << Pa_GetErrorText(deviceCount) << "\n";
+        return;
+    }
+    for (int i = 0; i < deviceCount; ++i) {
+        const PaDeviceInfo* info = Pa_GetDeviceInfo(i);
+        if (info != nullptr && info->maxInputChannels > 0) {
+            std::cout << i << "\t" << info->name << "\n";
+        }
+    }
+}
 
 int pickDevice() {
     const int deviceCount = Pa_GetDeviceCount();
@@ -381,14 +402,46 @@ int pickSampleRate(const PaStreamParameters& params, const PaDeviceInfo* info) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    bool listOnly = false;
+    int deviceArg = -1;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--list-devices") {
+            listOnly = true;
+        } else if (arg == "--device" && i + 1 < argc) {
+            try { deviceArg = std::stoi(argv[++i]); } catch (const std::exception&) { deviceArg = -1; }
+        } else if (arg.rfind("--device=", 0) == 0) {
+            try { deviceArg = std::stoi(arg.substr(9)); } catch (const std::exception&) { deviceArg = -1; }
+        }
+    }
+
     PaError err = Pa_Initialize();
     if (err != paNoError) {
         std::cerr << "Pa_Initialize: " << Pa_GetErrorText(err) << "\n";
         return 1;
     }
 
-    const int device = pickDevice();
+    if (listOnly) {
+        listDevices();
+        Pa_Terminate();
+        return 0;
+    }
+
+    int device;
+    if (deviceArg >= 0) {
+        // Так само валідуємо, як і інтерактивний вибір - інакше Pa_GetDeviceInfo
+        // на чужому індексі (з GUI) падає.
+        const PaDeviceInfo* chk = Pa_GetDeviceInfo(deviceArg);
+        if (chk == nullptr || chk->maxInputChannels <= 0) {
+            std::cerr << "Немає такого пристрою запису: " << deviceArg << "\n";
+            Pa_Terminate();
+            return 1;
+        }
+        device = deviceArg;
+    } else {
+        device = pickDevice();
+    }
     if (device < 0) {
         Pa_Terminate();
         return 1;
@@ -439,14 +492,38 @@ int main() {
     std::thread sender(senderThread, &ring, rate);
     std::thread meter(meterThread);
 
-    std::cout << "\nЗапис активний (" << rate << " Hz). Натисни Enter, щоб зупинити.\n";
-    std::string dummy;
-    std::getline(std::cin, dummy);
+    std::cout << "\nЗапис активний (" << rate << " Hz).\n"
+                 "Команди по одній на рядок: PAUSE, RESUME, QUIT (або просто Enter — вихід).\n"
+              << std::flush;
+
+    // Читаємо керування рядками зі stdin - це дозволяє і людині (Enter = вихід),
+    // і GUI-обгортці (пише в pipe клієнта) паузити/відновлювати запис без
+    // перезапуску процесу й перепідключення до Python-сервера.
+    std::string line;
+    while (g_running.load() && std::getline(std::cin, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line.empty() || line == "QUIT" || line == "quit") {
+            break;
+        }
+        if ((line == "PAUSE" || line == "pause") && !g_paused.load()) {
+            Pa_StopStream(stream);
+            g_paused.store(true);
+            std::cout << "\n⏸  Пауза.\n" << std::flush;
+        } else if ((line == "RESUME" || line == "resume") && g_paused.load()) {
+            Pa_StartStream(stream);
+            g_paused.store(false);
+            std::cout << "\n▶️  Відновлено.\n" << std::flush;
+        }
+    }
 
     g_running.store(false);
     if (sender.joinable()) sender.join();
     if (meter.joinable()) meter.join();
 
+    // Якщо стрім уже зупинено через PAUSE - повторний Pa_StopStream лише
+    // поверне помилку "вже зупинено", без побічних ефектів.
     Pa_StopStream(stream);
     Pa_CloseStream(stream);
     Pa_Terminate();

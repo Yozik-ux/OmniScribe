@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 legacy/
 build/
+.venv/
+dist/
+*.spec
+*.db
+.env

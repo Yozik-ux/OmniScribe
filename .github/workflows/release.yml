@@ -1,0 +1,142 @@
+name: Build installers
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версія (наприклад 0.1.0)"
+        required: false
+        default: "0.1.0"
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Версія з тега
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Системні залежності (Qt runtime, dpkg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon0 libxcb-cursor0 dpkg-dev
+
+      - name: Python-залежності
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt pyinstaller
+
+      - name: Збірка .deb
+        run: packaging/linux/build.sh "${{ steps.ver.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniscribe-linux-deb
+          path: dist/*.deb
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Версія з тега
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Переконатись, що NSIS є (fallback — Chocolatey)
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y
+          }
+
+      - name: Python-залежності
+        run: |
+          python -m venv .venv
+          .venv\Scripts\pip install --upgrade pip
+          .venv\Scripts\pip install -r requirements.txt pyinstaller
+
+      - name: PyInstaller
+        shell: cmd
+        run: |
+          .venv\Scripts\pyinstaller --noconfirm --clean --onedir --name OmniScribe --paths . --add-data "assets;assets" app.py
+
+      - name: NSIS
+        shell: cmd
+        run: |
+          makensis /DVERSION=${{ steps.ver.outputs.version }} packaging\windows\installer.nsi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniscribe-windows-setup
+          path: dist/OmniScribe-Setup-*.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Версія з тега
+        id: ver
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Збірка .app і .dmg
+        run: packaging/macos/build.sh "${{ steps.ver.outputs.version }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: omniscribe-macos-dmg
+          path: dist/*.dmg
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Reliz
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/omniscribe-linux-deb/*.deb
+            artifacts/omniscribe-windows-setup/*.exe
+            artifacts/omniscribe-macos-dmg/*.dmg

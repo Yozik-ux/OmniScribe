@@ -30,6 +30,15 @@ SCOPES = [
 PENDING_PREFIX = "▸ "
 GREY = {"color": {"rgbColor": {"red": 0.53, "green": 0.53, "blue": 0.53}}}
 BLACK = {"color": {"rgbColor": {"red": 0.0, "green": 0.0, "blue": 0.0}}}
+HIGHLIGHT_YELLOW = {"color": {"rgbColor": {"red": 1.0, "green": 0.93, "blue": 0.55}}}
+WARNING_RED = {"color": {"rgbColor": {"red": 0.76, "green": 0.08, "blue": 0.08}}}
+
+# Заголовки: рівень (кількість #) -> стиль Google Docs.
+HEADING_STYLES = {1: "HEADING_1", 2: "HEADING_2", 3: "HEADING_3"}
+
+# Відступ на один рівень вкладеності списку (заміна дерева/стрілок з
+# рукописних конспектів - ієрархія через відступ, а не через малюнок).
+INDENT_PER_LEVEL_PT = 18
 
 RETRY_STATUSES = {429, 500, 502, 503, 504}
 
@@ -67,7 +76,7 @@ class DocsWriter:
         return self._drive
 
     def _create_document(self, share_with: str) -> str:
-        title = f"Конспект — {datetime.now():%d.%m.%Y %H:%M}"
+        title = f"OmniScribe — {datetime.now():%d.%m.%Y %H:%M}"
         doc = self._exec(lambda: self.docs.documents().create(body={"title": title}))
         doc_id = doc["documentId"]
 
@@ -144,22 +153,54 @@ class DocsWriter:
                 print(f"❌ Не вдалося вставити чернетку: {exc}", flush=True)
                 return None
 
-    def commit(self, pending_name: str | None, blocks: list[Block]) -> bool:
+    def commit(
+        self,
+        pending_name: str | None,
+        blocks: list[Block],
+        target_section_id: int | None = None,
+    ) -> bool:
         """Замінити чернетку відформатованим конспектом.
 
-        Якщо NamedRange зник (студент видалив абзац) — дописуємо в кінець.
+        Якщо pending_name вказує на NamedRange чернетки — видаляємо її.
+        Якщо target_section_id вказує на існуючий розділ (NamedRange
+        "sect{id}") — дописуємо саме туди, а не в кінець документа. У обох
+        випадках, коли NamedRange зник (студент видалив абзац/розділ) —
+        просто дописуємо в кінець, не падаємо.
+
+        Якщо target_section_id задано, після запису завжди (пере)створюємо
+        NamedRange "sect{id}" навколо щойно вставленого тексту — так розділ
+        лишається адресованим і для наступних викликів commit().
         """
         if not blocks:
             return False
 
+        section_name = f"sect{target_section_id}" if target_section_id is not None else None
+
         with self._lock:
             try:
-                snap = self._snapshot(with_named_ranges=bool(pending_name))
+                snap = self._snapshot(with_named_ranges=bool(pending_name or section_name))
                 requests: list[dict] = []
                 target = None
 
                 if pending_name:
                     found = self._find_range(snap["named_ranges"], pending_name)
+                    if found:
+                        rng_id, rng = found
+                        target = rng["startIndex"]
+                        requests.append({"deleteNamedRange": {"namedRangeId": rng_id}})
+                        if rng["endIndex"] > rng["startIndex"]:
+                            requests.append(
+                                {
+                                    "deleteContentRange": {
+                                        "range": {
+                                            "startIndex": rng["startIndex"],
+                                            "endIndex": rng["endIndex"],
+                                        }
+                                    }
+                                }
+                            )
+                elif section_name:
+                    found = self._find_range(snap["named_ranges"], section_name)
                     if found:
                         rng_id, rng = found
                         target = rng["startIndex"]
@@ -183,6 +224,21 @@ class DocsWriter:
                     prefix = ""
 
                 requests.extend(self._render(target, prefix, blocks))
+
+                if section_name:
+                    payload_len = self._payload_len(prefix, blocks)
+                    requests.append(
+                        {
+                            "createNamedRange": {
+                                "name": section_name,
+                                "range": {
+                                    "startIndex": target,
+                                    "endIndex": target + payload_len,
+                                },
+                            }
+                        }
+                    )
+
                 self._batch(requests)
                 return True
             except Exception as exc:  # noqa: BLE001
@@ -190,6 +246,14 @@ class DocsWriter:
                 return False
 
     # ------------------------------------------------------------ рендер блоків
+
+    @staticmethod
+    def _payload_len(prefix: str, blocks: list[Block]) -> int:
+        """Довжина (у UTF-16) того самого payload, який складає _render."""
+        length = u16len(prefix)
+        for block in blocks:
+            length += u16len(block.text + "\n")
+        return length
 
     def _render(self, start: int, prefix: str, blocks: list[Block]) -> list[dict]:
         """Складає insertText + усі стилі. Індекси — відносно start, у UTF-16."""
@@ -227,7 +291,9 @@ class DocsWriter:
                     {
                         "updateParagraphStyle": {
                             "range": {"startIndex": start + s, "endIndex": start + e},
-                            "paragraphStyle": {"namedStyleType": "HEADING_3"},
+                            "paragraphStyle": {
+                                "namedStyleType": HEADING_STYLES.get(block.level, "HEADING_3")
+                            },
                             "fields": "namedStyleType",
                         }
                     }
@@ -244,7 +310,7 @@ class DocsWriter:
             }
         )
 
-        # 3. Жирні терміни.
+        # 3. Жирні терміни, виділення (==...==) та попередження (!!...!!).
         for s, _e, block in spans:
             for b_start, b_end in block.bold:
                 abs_start = start + s + u16len(block.text[:b_start])
@@ -259,8 +325,52 @@ class DocsWriter:
                             }
                         }
                     )
+            for h_start, h_end in block.highlight:
+                abs_start = start + s + u16len(block.text[:h_start])
+                abs_end = start + s + u16len(block.text[:h_end])
+                if abs_end > abs_start:
+                    requests.append(
+                        {
+                            "updateTextStyle": {
+                                "range": {"startIndex": abs_start, "endIndex": abs_end},
+                                "textStyle": {"backgroundColor": HIGHLIGHT_YELLOW},
+                                "fields": "backgroundColor",
+                            }
+                        }
+                    )
+            for w_start, w_end in block.warning:
+                abs_start = start + s + u16len(block.text[:w_start])
+                abs_end = start + s + u16len(block.text[:w_end])
+                if abs_end > abs_start:
+                    requests.append(
+                        {
+                            "updateTextStyle": {
+                                "range": {"startIndex": abs_start, "endIndex": abs_end},
+                                "textStyle": {"bold": True, "foregroundColor": WARNING_RED},
+                                "fields": "bold,foregroundColor",
+                            }
+                        }
+                    )
 
-        # 4. Списки — суміжні пункти одного типу групуємо в один запит.
+        # 4. Відступи для вкладених пунктів списку - рівень вкладеності замінює
+        #    стрілки/дерево з рукописних конспектів ієрархією через відступ.
+        #    Має виконатись ДО createParagraphBullets: Docs визначає рівень
+        #    вкладеності списку саме за поточним відступом абзацу.
+        for s, e, block in spans:
+            if block.kind in ("bullet", "number") and block.level > 1:
+                pt = (block.level - 1) * INDENT_PER_LEVEL_PT
+                indent = {"magnitude": pt, "unit": "PT"}
+                requests.append(
+                    {
+                        "updateParagraphStyle": {
+                            "range": {"startIndex": start + s, "endIndex": start + e},
+                            "paragraphStyle": {"indentFirstLine": indent, "indentStart": indent},
+                            "fields": "indentFirstLine,indentStart",
+                        }
+                    }
+                )
+
+        # 5. Списки — суміжні пункти одного типу групуємо в один запит.
         for kind, preset in (
             ("bullet", "BULLET_DISC_CIRCLE_SQUARE"),
             ("number", "NUMBERED_DECIMAL_ALPHA_ROMAN"),
